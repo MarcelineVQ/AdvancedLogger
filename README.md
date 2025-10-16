@@ -1,6 +1,7 @@
 # AdvancedLogger
 
-An advanced combat logging addon for Turtle WoW that provides comprehensive raid logging with detailed event tracking.
+An advanced combat logging addon for Turtle WoW that provides comprehensive raid logging with detailed event tracking.  
+Not currently entirely compatible with melbaa's consume tracker, many trinket uses and consumes won't be tracked as melbaa's doesn't read raw spell ids.  
 
 ## Features
 
