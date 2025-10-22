@@ -54,7 +54,7 @@ def replace_instances(player_name, filename):
     raid_target_marks = {"Star", "Circle", "Diamond", "Triangle", "Moon", "Square", "Cross", "Skull"}
 
     # Pattern to match cast lines with spell IDs - captures spell ID in group 3
-    cast_with_id_pattern = re.compile(r"(.* (?:casts|channels|begins to cast) )(.+?)\((\d+)\)(?:\(Rank \d+\))?( .*)?")
+    cast_with_id_pattern = re.compile(r"(.* (?:casts|channels|begins to cast|fails casting) )(.+?)\((\d+)\)(?:\(Rank \d+\))?( .*)?")
 
     # Patterns for filtering unwanted cast lines (non-greylist)
     unwanted_cast_patterns = [
@@ -69,6 +69,9 @@ def replace_instances(player_name, filename):
         "MODEL_UPDATE:",
         "CHAT_MSG:"
     ]
+
+    # Pattern to match any "fails casting" line (with or without spell ID)
+    fails_casting_pattern = re.compile(r".* fails casting ")
 
     # Mob names with apostrophes - temporarily remove apostrophes to avoid parsing issues
     # These will be restored later in the renames section
@@ -318,8 +321,14 @@ def replace_instances(player_name, filename):
             spell_name = cast_match.group(2).strip()
             spell_id = int(cast_match.group(3))
 
-            # Always filter out 'channels' and 'begins to cast' with spell IDs
-            if "channels" in prefix or "begins to cast" in prefix:
+            # Remove raid marks from caster name in prefix
+            clean_prefix = prefix
+            for mark in raid_target_marks:
+                clean_prefix = re.sub(rf'\({mark}\)', '', clean_prefix)
+            prefix = clean_prefix
+
+            # Always filter out 'channels', 'begins to cast', and 'fails casting' with spell IDs
+            if "channels" in prefix or "begins to cast" in prefix or "fails casting" in prefix:
                 should_filter = True
             elif "casts" in prefix:
                 # Only apply greylist logic to 'casts' lines
@@ -364,6 +373,10 @@ def replace_instances(player_name, filename):
                 if prefix in line:
                     should_filter = True
                     break
+
+        # Filter out all "fails casting" lines (with or without spell ID)
+        if not should_filter and fails_casting_pattern.search(line):
+            should_filter = True
 
         if should_filter:
             continue  # Skip this line
