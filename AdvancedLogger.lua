@@ -17,16 +17,32 @@ local _G = _G or getfenv(0)
 local marks = { "Star", "Circle", "Diamond", "Triangle", "Moon", "Square", "Cross", "Skull" }
 
 -- todo, obviate the xml
-local ALogger = CreateFrame("FRAME")
-ALogger.VERSION = 20
+ALogger = CreateFrame("FRAME")
+ALogger.VERSION = tonumber(GetAddOnMetadata("AdvancedLogger","Version")) or 0
 ALogger.MAX_MESSAGE_LENGTH = 500
-ALogger.CONSOLIDATE_CHARACTER = "{"
-ALogger.MESSAGE_PREFIX = "ALogger_HELPER_"
 
 ALogger.PlayerInformation = {}
 ALogger.Synchronizers = {}
 ALogger.LoggedCombatantInfo = {}
 ALogger.mob_list = {}
+ALogger.TalentInfo = {}  -- Store other players' talents: [playerName] = { [tree] = "00503..." }
+ALogger.TalentLastUpdate = {}  -- Track when we last got talents: [playerName] = timestamp
+ALogger.InspectionQueue = {}  -- Queue of players to inspect: { name1, name2, ... }
+ALogger.QueuedInspectionCount = 0  -- Number of active inspections
+ALogger.CurrentInspectionTarget = nil  -- Currently inspecting this player
+ALogger.LastInspectionRequest = 0  -- Timestamp of last inspection request
+ALogger.TALENT_REFRESH_INTERVAL = 300  -- Re-check talents every 5 minutes (300 seconds)
+
+-- Hook TWInspectTalents_Show to suppress the window during automated scans
+local orig_TWInspectTalents_Show = TWInspectTalents_Show
+TWInspectTalents_Show = function()
+	-- If we're doing an automated scan, don't show the window
+	if ALogger.QueuedInspectionCount > 0 then
+		return
+	end
+	-- Otherwise, call the original function
+	orig_TWInspectTalents_Show()
+end
 
 -- capture global functions as local to reduce lua global table lookups
 local tinsert = table.insert
@@ -105,15 +121,28 @@ ALogger:RegisterEvent("PET_STABLE_CLOSED")
 
 ALogger:RegisterEvent("CHAT_MSG_LOOT")
 ALogger:RegisterEvent("CHAT_MSG_SYSTEM")
+ALogger:RegisterEvent("CHAT_MSG_ADDON")
 
 ALogger:RegisterEvent("UNIT_INVENTORY_CHANGED")
-
+ALogger:RegisterEvent("UI_ERROR_MESSAGE")
 ALogger:SetScript("OnEvent", function () return ALogger[event](ALogger,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9) end)
+ALogger:SetScript("OnUpdate", function() ALogger:OnUpdate() end)
+
 
 -- todo change this to only grab from people in-raid/party, and only when not in combat?
 function ALogger:UNIT_INVENTORY_CHANGED(unit)
+	if not unit then return end
 	if self.inCombat then return end -- don't care about weapon swaps
+	-- only care about (p)arty, (p)layer, and (r)aid members
+	if not (string.find(unit,"^p") or string.find(unit,"^r")) then return end
 	self:grab_unit_information(unit)
+end
+
+function ALogger:UI_ERROR_MESSAGE(msg)
+	-- Suppress "Unknown Unit" errors during automated talent scans
+	if self.QueuedInspectionCount > 0 and msg and (string.find(msg, "^Unknown unit") or string.find(msg, "^You can't inspect")) then
+		UIErrorsFrame:Clear()
+	end
 end
 
 function ALogger:PLAYER_REGEN_ENABLED()
@@ -131,7 +160,7 @@ local fmt_raw_with_rank = "%s(%s) %s %s(%s)(%s)."
 local fmt_raw_with_target = "%s(%s) %s %s(%s) on %s(%s)."
 local fmt_raw_simple = "%s(%s) %s %s(%s)."
 
--- todo, remove specail case for items, who cares, it's all spells
+-- todo, remove special case for items, who cares, it's all spells
 function ALogger:UNIT_CASTEVENT(caster, target, event, spellID, castDuration)
 	if not (caster and spellID) then return end
 	if event == "MAINHAND" or event == "OFFHAND" then return end
@@ -229,6 +258,12 @@ function ALogger:RegisterSpellData(forced)
 	end
 end
 
+-- helper to easily force on for testing
+function ALoggerForce()
+	ALogger:RegisterSpellData(true)
+end
+
+
 local function get_mark_str(guid)
 	local mark = mark_cache and mark_cache[guid]
 	return mark and ("(" .. marks[mark] .. ")") or ""
@@ -292,6 +327,14 @@ function ALogger:RAID_TARGET_UPDATE()
 			new_cache[guid] = i
 		end
 	end
+
+	-- Preserve cache entries for units that still exist (prevents rapid reapplication spam)
+	for guid, old_mark in pairs(mark_cache) do
+		if not new_cache[guid] and UnitExists(guid) and not UnitIsDead(guid) then
+			new_cache[guid] = old_mark  -- Keep in cache if unit still alive
+		end
+	end
+
 	mark_cache = new_cache
 end
 
@@ -466,11 +509,16 @@ function ALogger:RAID_ROSTER_UPDATE()
 	end
 	for i = 1, rnow do
 		local unit = "raid" .. i
-		if UnitName(unit) then
+		local name = UnitName(unit)
+		if name then
+			-- Queue talent inspection for new players (will be skipped if recently inspected)
+			self:QueuePlayerInspection(unit)
+			-- Grab equipment info immediately
 			self:grab_unit_information(unit)
 		end
 	end
 	rcount = rnow
+	-- Queue processing handled by OnUpdate
 end
 
 local pcount = 0
@@ -482,17 +530,22 @@ function ALogger:PARTY_MEMBERS_CHANGED()
 	end
 	for i = 1, pnow do
 		local unit = "party" .. i
-		if UnitName(unit) then
+		local name = UnitName(unit)
+		if name then
+			-- Queue inspection for party members to get talents
+			self:QueuePlayerInspection(unit)
 			self:grab_unit_information(unit)
 		end
 	end
 	pcount = pnow
+	-- Queue processing handled by OnUpdate
 end
 
 function ALogger:UNIT_PET(unit)
-	if unit then
-		self:grab_unit_information(unit)
-	end
+	if not unit then return end
+	-- only care about (p)arty, (p)layer, and (r)aid members
+	if not (string.find(unit,"^p") or string.find(unit,"^r")) then return end
+	self:grab_unit_information(unit)
 end
 
 function ALogger:PLAYER_PET_CHANGED()
@@ -503,13 +556,11 @@ function ALogger:PET_STABLE_CLOSED()
 	self:grab_unit_information("player")
 end
 
--- todo: this misses too much
+-- todo: this misses too much, what can we do?
 function ALogger:CHAT_MSG_LOOT(msg)
-	-- if not self:ContainsSynchronizer(msg) then
-		local r = "LOOT: " .. date("%d.%m.%y %H:%M:%S") .. "&" .. msg
-		CombatLogAdd(r)
-		CombatLogAdd(r, 1)
-	-- end
+	local r = "LOOT: " .. date("%d.%m.%y %H:%M:%S") .. "&" .. msg
+	CombatLogAdd(r)
+	CombatLogAdd(r, 1)
 end
 
 function ALogger:CHAT_MSG_SYSTEM(msg)
@@ -522,13 +573,188 @@ function ALogger:CHAT_MSG_SYSTEM(msg)
 	end
 end
 
-function ALogger:ContainsSynchronizer(msg)
-	for key, val in pairs(self.Synchronizers) do
-		if strfind(msg, key) ~= nil then
-			return true
+-- Queue a player for inspection to collect talents and equipment
+-- @param unit: Unit ID to inspect (e.g., "raid1", "party2")
+-- @param force: Force inspection even if recently updated
+function ALogger:QueuePlayerInspection(unit, force)
+	if not unit then return end
+
+	local playerName = UnitName(unit)
+	if not playerName or UnitIsUnit(unit, "player") then return end
+
+	-- Don't queue if already queued
+	for _, queuedUnit in ipairs(self.InspectionQueue) do
+		if UnitIsUnit(queuedUnit, unit) then
+			return  -- Already queued
 		end
 	end
-	return false
+
+	-- Don't queue if recently inspected (unless forced)
+	if not force and self.TalentLastUpdate[playerName] then
+		local timeSinceUpdate = GetTime() - self.TalentLastUpdate[playerName]
+		if timeSinceUpdate < self.TALENT_REFRESH_INTERVAL then
+			return  -- Recently inspected
+		end
+	end
+
+	tinsert(self.InspectionQueue, unit)
+end
+
+-- Trigger inspection for the next player in queue
+function ALogger:ProcessInspectionQueue()
+	if self.QueuedInspectionCount > 0 then
+		return  -- Already inspecting someone
+	end
+
+	if table.getn(self.InspectionQueue) == 0 then
+		return  -- Nothing to inspect
+	end
+
+	-- Get next player from queue
+	local unit = table.remove(self.InspectionQueue, 1)
+	local playerName = UnitName(unit)
+
+	-- Skip if player not found or offline
+	if not playerName or not UnitIsConnected(unit) then
+		-- Player is offline or left raid/party, try next in queue
+		self:ProcessInspectionQueue()
+		return
+	end
+
+	-- Initialize talent storage for this player
+	self.TalentInfo[playerName] = { "", "", "" }
+
+	-- Track active inspection
+	self.CurrentInspectionTarget = playerName
+	self.QueuedInspectionCount = self.QueuedInspectionCount + 1
+
+	-- Request talents directly via addon message (Turtle WoW inspection protocol)
+	-- Format: SendAddonMessage("TW_CHAT_MSG_WHISPER<PlayerName>", "INSShowTalents", "GUILD")
+	SendAddonMessage("TW_CHAT_MSG_WHISPER<"..playerName..">", "INSShowTalents", "GUILD")
+	self.LastInspectionRequest = GetTime()
+end
+
+-- OnUpdate handler to check for inspection timeouts and periodic talent refreshes
+local last_inspection_check = GetTime()
+local last_talent_refresh_check = GetTime()
+function ALogger:OnUpdate()
+	local now = GetTime()
+
+	-- Check for inspection timeout and process queue
+	if now > last_inspection_check + 0.2 then
+		last_inspection_check = now
+
+		-- If someone isn't responding to talent query, reset after 3 seconds
+		if self.QueuedInspectionCount > 0 and (now - self.LastInspectionRequest > 3) then
+			self.QueuedInspectionCount = 0
+			self.CurrentInspectionTarget = nil
+		end
+
+		-- Process inspection queue (handles rate limiting internally)
+		self:ProcessInspectionQueue()
+	end
+
+	-- Check for talent refreshes every 30 seconds (still with a 5 min cd on successes)
+	if now > last_talent_refresh_check + 30 then
+		last_talent_refresh_check = now
+
+		-- Queue talent refresh for raid members
+		local numRaid = GetNumRaidMembers()
+		if numRaid > 0 then
+			for i = 1, numRaid do
+				local unit = "raid"..i
+				if UnitName(unit) then
+					-- QueuePlayerInspection will check if refresh is needed
+					self:QueuePlayerInspection(unit)
+				end
+			end
+		else
+			-- Queue talent refresh for party members
+			local numParty = GetNumPartyMembers()
+			for i = 1, numParty do
+				local unit = "party"..i
+				if UnitName(unit) then
+					self:QueuePlayerInspection(unit)
+				end
+			end
+		end
+	end
+end
+
+-- Parse talent information from addon messages (Turtle WoW inspection system)
+function ALogger:CHAT_MSG_ADDON(prefix, message, channel, from)
+	if prefix ~= "TW_CHAT_MSG_WHISPER" then return end
+
+	-- Only process messages from the player we're currently inspecting
+	-- This prevents stale messages from previous inspections
+	if from ~= self.CurrentInspectionTarget then
+		return
+	end
+
+	-- Check for inspection completion
+	if string.find(message, "INSTalentEND") then
+		self.QueuedInspectionCount = math.max(self.QueuedInspectionCount - 1, 0)
+		self.CurrentInspectionTarget = nil
+
+		-- Record successful talent update
+		self.TalentLastUpdate[from] = GetTime()
+
+		-- Trigger equipment update for this player now that talents are collected
+		-- Find the unit ID for this player
+		local unit = nil
+		local numRaid = GetNumRaidMembers()
+		if numRaid > 0 then
+			for i = 1, numRaid do
+				if UnitName("raid"..i) == from then
+					unit = "raid"..i
+					break
+				end
+			end
+		else
+			local numParty = GetNumPartyMembers()
+			for i = 1, numParty do
+				if UnitName("party"..i) == from then
+					unit = "party"..i
+					break
+				end
+			end
+		end
+
+		if unit then
+			self:grab_unit_information(unit)
+		end
+
+		-- Next inspection will be processed by OnUpdate
+		return
+	end
+
+	if not string.find(message, "INSTalentInfo") then return end
+
+	-- Parse talent message: INSTalentInfo;tree;index;name;tier;column;currRank;maxRank;meetsPrereq
+	local parts = {}
+	local start = 1
+	for i = 1, 9 do
+		local pos = string.find(message, ";", start, true)
+		if pos then
+			tinsert(parts, strsub(message, start, pos - 1))
+			start = pos + 1
+		else
+			tinsert(parts, strsub(message, start))
+			break
+		end
+	end
+
+	if table.getn(parts) >= 7 then
+		local tree = tonumber(parts[2])
+		local currRank = tonumber(parts[7])
+
+		if tree and currRank then
+			-- Append rank to the tree's talent string
+			-- We've already verified this is from CurrentInspectionTarget
+			-- and initialized the table in ProcessInspectionQueue
+			self.TalentInfo[from][tree] = self.TalentInfo[from][tree] .. currRank
+		end
+	end
 end
 
 function ALogger:QueueRaidIds()
@@ -553,10 +779,11 @@ function ALogger:QueueRaidIds()
 	end
 end
 
--- todo, tired of this not recording xmog gear id properly
+-- NB Server sends weird custom item id's for xmogged items, real ones don't exist in a form we can extract
+-- the only way to get around this would be to keep our own item db and to compare item names
 function ALogger:grab_unit_information(unit)
 	local unit_name = UnitName(unit)
-	if UnitIsPlayer(unit) and unit_name ~= nil and unit_name ~= Unknown and not self:ContainsSynchronizer(unit_name) then
+	if UnitIsPlayer(unit) and unit_name ~= nil and unit_name ~= Unknown then
 		if self.PlayerInformation[unit_name] == nil then
 			self.PlayerInformation[unit_name] = {}
 		end
@@ -637,6 +864,7 @@ function ALogger:grab_unit_information(unit)
 
 		-- Talents
 		if unit == "player" then
+			-- Get player's own talents directly from API
 			local talents = { "", "", "" };
 			for t = 1, 3 do
 				local numTalents = GetNumTalents(t);
@@ -653,6 +881,14 @@ function ALogger:grab_unit_information(unit)
 
 			if talents ~= nil then
 				info["talents"] = talents
+			end
+		else
+			-- Get other players' talents from addon message cache
+			if self.TalentInfo[unit_name] then
+				local talents = strjoin("}", self.TalentInfo[unit_name][1], self.TalentInfo[unit_name][2], self.TalentInfo[unit_name][3])
+				if strlen(talents) > 10 then
+					info["talents"] = talents
+				end
 			end
 		end
 
@@ -698,8 +934,4 @@ function prep_value(val)
 		return "nil"
 	end
 	return val
-end
-
-function ALogger:SendMessage(msg)
-	DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8080LegacyPlayers|r: " .. msg)
 end

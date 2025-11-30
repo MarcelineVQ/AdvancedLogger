@@ -1,5 +1,8 @@
 # AdvancedLogger
 
+This isn't for general use, it's for power users who want to examine logs, use https://github.com/pepopo978/SuperWowCombatLogger/ for a powerful logger with better updates and log site support.
+---
+
 An advanced combat logging addon for Turtle WoW that provides comprehensive raid logging with detailed event tracking.  
 Not currently entirely compatible with melbaa's consume tracker, many trinket uses and consumes won't be tracked as melbaa's doesn't read raw spell ids.  
 
@@ -26,7 +29,7 @@ Not currently entirely compatible with melbaa's consume tracker, many trinket us
   - Guild name, rank name, and rank index
   - Pet names
   - Complete gear inventory (all 19 equipment slots with item IDs and enchants)
-  - Talent specialization (for player character)
+  - Talent specialization (for any character)
 - **Automatic Roster Updates**: Captures player info when joining raid/party and on zone changes
 
 ### Loot & Economy
